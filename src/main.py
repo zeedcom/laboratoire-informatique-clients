@@ -11,41 +11,78 @@ import httpx
 # ---------------------------------------------------------------- CONFIG ----
 BASE_URL = "https://laboinfo.pythonanywhere.com"          # Android emulator: http://10.0.2.2:8000
 LOGIN_URL = "/api/auth/token/"                   # SimpleJWT (change if you use another auth)
+REFRESH_URL = "/api/auth/token/refresh/"
 TENDERS_URL = "/api/tenders/"
 DOCUMENTS_URL = "/api/tender-documents/"
 BIDS_URL = "/api/bid-submissions/"
 
 
 # ------------------------------------------------------------- API CLIENT ---
+class AuthError(Exception):
+    """Raised when the session is no longer valid (login required)."""
+
+
 class Api:
     def __init__(self):
-        self.headers = {}
+        self.access = None
+        self.refresh = None
+        self.on_tokens = None  # async callback(access, refresh) used to persist tokens
+
+    @property
+    def headers(self):
+        return {"Authorization": f"Bearer {self.access}"} if self.access else {}
+
+    async def set_tokens(self, access, refresh=None):
+        self.access = access
+        if refresh:
+            self.refresh = refresh
+        if self.on_tokens:
+            await self.on_tokens(self.access, self.refresh)
 
     async def login(self, username: str, password: str):
         async with httpx.AsyncClient(timeout=20) as c:
             r = await c.post(BASE_URL + LOGIN_URL, json={"username": username, "password": password})
             r.raise_for_status()
             data = r.json()
-        if "access" in data:
-            self.headers = {"Authorization": f"Bearer {data['access']}"}
-        else:
-            self.headers = {"Authorization": f"Token {data['token']}"}
+        await self.set_tokens(data["access"], data.get("refresh"))
+
+    async def refresh_access(self) -> bool:
+        if not self.refresh:
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=20) as c:
+                r = await c.post(BASE_URL + REFRESH_URL, json={"refresh": self.refresh})
+            if r.status_code != 200:
+                return False
+            data = r.json()
+            await self.set_tokens(data["access"], data.get("refresh"))
+            return True
+        except Exception:
+            return False
+
+    async def request(self, method: str, path: str, **kw):
+        async with httpx.AsyncClient(timeout=20) as c:
+            r = await c.request(method, BASE_URL + path, headers=self.headers, **kw)
+            if r.status_code == 401:
+                if await self.refresh_access():
+                    r = await c.request(method, BASE_URL + path, headers=self.headers, **kw)
+                if r.status_code == 401:
+                    raise AuthError("Session expired")
+        return r
 
     async def get(self, path: str, params: dict | None = None):
         params = {k: v for k, v in (params or {}).items() if v}
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.get(BASE_URL + path, params=params, headers=self.headers)
-            r.raise_for_status()
-            data = r.json()
+        r = await self.request("GET", path, params=params)
+        r.raise_for_status()
+        data = r.json()
         # supports paginated and non-paginated DRF responses
         return data["results"] if isinstance(data, dict) and "results" in data else data
 
     async def post(self, path: str, payload: dict):
-        async with httpx.AsyncClient(timeout=20) as c:
-            r = await c.post(BASE_URL + path, json=payload, headers=self.headers)
-            if r.status_code >= 400:
-                raise Exception(r.text)
-            return r.json()
+        r = await self.request("POST", path, json=payload)
+        if r.status_code >= 400:
+            raise Exception(r.text)
+        return r.json()
 
 
 api = Api()
@@ -79,6 +116,84 @@ async def main(page: ft.Page):
             [ft.Icon(icon, size=16, color=ft.Colors.GREY_700), ft.Text(text, expand=True, **kw)],
             vertical_alignment=ft.CrossAxisAlignment.START,
         )
+
+    # ------------------------------------------------------ TOKEN STORAGE ----
+    async def store_get(key: str):
+        try:
+            return await ft.SharedPreferences().get(key)
+        except Exception:
+            try:
+                return await page.client_storage.get_async(key)   # older Flet fallback
+            except Exception:
+                return None
+
+    async def store_set(key: str, value: str):
+        try:
+            await ft.SharedPreferences().set(key, value)
+        except Exception:
+            try:
+                await page.client_storage.set_async(key, value)
+            except Exception:
+                pass
+
+    async def store_remove(key: str):
+        try:
+            await ft.SharedPreferences().remove(key)
+        except Exception:
+            try:
+                await page.client_storage.remove_async(key)
+            except Exception:
+                pass
+
+    async def save_tokens(access, refresh):
+        if access:
+            await store_set("access", access)
+        if refresh:
+            await store_set("refresh", refresh)
+
+    api.on_tokens = save_tokens
+
+    async def logout():
+        api.access = None
+        api.refresh = None
+        await store_remove("access")
+        await store_remove("refresh")
+        show_login()
+
+    async def do_logout(e):
+        await logout()
+
+    # ------------------------------------------------------ OPEN LINKS ----
+    async def open_url(url: str):
+        url = (url or "").strip()
+        if url.startswith("/"):                       # relative path from Django
+            url = BASE_URL + url
+        elif not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        errors = []
+
+        # attempt 1: page.launch_url
+        try:
+            await page.launch_url(url)
+            return
+        except Exception as ex:
+            errors.append(f"page.launch_url: {type(ex).__name__}: {ex}")
+
+        # attempt 2: UrlLauncher service
+        try:
+            await ft.UrlLauncher().launch_url(url)
+            return
+        except Exception as ex:
+            errors.append(f"UrlLauncher: {type(ex).__name__}: {ex}")
+
+        toast(f"Cannot open {url}\n" + "\n".join(errors))
+
+    def link_button(label: str, icon, url: str) -> ft.TextButton:
+        async def handler(e):
+            await open_url(url)
+
+        return ft.TextButton(label, icon=icon, on_click=handler)
 
     # ------------------------------------------------------------ LOGIN ----
     def show_login():
@@ -127,8 +242,11 @@ async def main(page: ft.Page):
         )
 
     # ------------------------------------------------------------- HOME ----
-    ref_filter = ft.TextField(label="Reference", expand=True, dense=True, on_submit=lambda e: page.run_task(load_tenders))
-    org_filter = ft.TextField(label="Organization", expand=True, dense=True, on_submit=lambda e: page.run_task(load_tenders))
+    async def on_filter_submit(e):
+        await load_tenders()
+
+    ref_filter = ft.TextField(label="Reference", expand=True, dense=True, on_submit=on_filter_submit)
+    org_filter = ft.TextField(label="Organization", expand=True, dense=True, on_submit=on_filter_submit)
     tenders_list = ft.ListView(expand=True, spacing=10, padding=ft.Padding.all(12))
     loader = ft.ProgressBar(visible=False)
 
@@ -166,14 +284,14 @@ async def main(page: ft.Page):
     def tender_card(t: dict) -> ft.Card:
         docs_count = len(t.get("documents") or [])
 
-        async def open_url(url):
-            await page.launch_url(url)
-
         links = []
         if t.get("file_url"):
-            links.append(ft.TextButton("File", icon=ft.Icons.ATTACH_FILE, on_click=lambda e, u=t["file_url"]: page.run_task(open_url, u)))
+            links.append(link_button("File", ft.Icons.ATTACH_FILE, t["file_url"]))
         if t.get("source_url"):
-            links.append(ft.TextButton("Source", icon=ft.Icons.OPEN_IN_NEW, on_click=lambda e, u=t["source_url"]: page.run_task(open_url, u)))
+            links.append(link_button("Source", ft.Icons.OPEN_IN_NEW, t["source_url"]))
+
+        async def go_bids(e):
+            await show_bids(t)
 
         return ft.Card(
             elevation=2,
@@ -204,7 +322,7 @@ async def main(page: ft.Page):
                                 ft.Button(
                                     "Bid Submissions",
                                     icon=ft.Icons.ASSIGNMENT_TURNED_IN,
-                                    on_click=lambda e, tender=t: page.run_task(show_bids, tender),
+                                    on_click=go_bids,
                                 ),
                             ],
                             alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -227,6 +345,9 @@ async def main(page: ft.Page):
             tenders_list.controls = [tender_card(t) for t in data] or [
                 ft.Container(ft.Text("No tenders found"), alignment=ft.Alignment.CENTER, padding=40)
             ]
+        except AuthError:
+            await logout()
+            return
         except Exception as ex:
             toast(f"Error: {ex}")
         loader.visible = False
@@ -279,6 +400,9 @@ async def main(page: ft.Page):
             )
         )
 
+    async def on_refresh(e):
+        await load_tenders()
+
     def show_home():
         page.clean()
         page.appbar = ft.AppBar(
@@ -287,8 +411,8 @@ async def main(page: ft.Page):
             color=ft.Colors.WHITE,
             actions=[
                 ft.IconButton(ft.Icons.FILTER_LIST, tooltip="Filters", on_click=toggle_filters),
-                ft.IconButton(ft.Icons.REFRESH, tooltip="Refresh", on_click=lambda e: page.run_task(load_tenders)),
-                ft.IconButton(ft.Icons.LOGOUT, tooltip="Logout", on_click=lambda e: show_login()),
+                ft.IconButton(ft.Icons.REFRESH, tooltip="Refresh", on_click=on_refresh),
+                ft.IconButton(ft.Icons.LOGOUT, tooltip="Logout", on_click=do_logout),
             ],
         )
         # fixed bottom-right "+" button
@@ -323,14 +447,15 @@ async def main(page: ft.Page):
             )
         )
 
+    async def back_home(e):
+        show_home()
+        await load_tenders()
+
     async def show_bids(tender: dict):
         page.clean()
         page.floating_action_button = None
         page.appbar = ft.AppBar(
-            leading=ft.IconButton(
-                ft.Icons.ARROW_BACK,
-                on_click=lambda e: (show_home(), page.run_task(load_tenders)),
-            ),
+            leading=ft.IconButton(ft.Icons.ARROW_BACK, on_click=back_home),
             title=ft.Text(f"Bids - {val(tender.get('reference'))}"),
             bgcolor=ft.Colors.INDIGO,
             color=ft.Colors.WHITE,
@@ -348,12 +473,22 @@ async def main(page: ft.Page):
                 bids_list.controls.append(
                     ft.Container(ft.Text("No bid submissions"), alignment=ft.Alignment.CENTER, padding=40)
                 )
+        except AuthError:
+            await logout()
+            return
         except Exception as ex:
             toast(f"Error: {ex}")
         bar.visible = False
         page.update()
 
-    show_login()
+    # ------------------------------------------------------------ START ----
+    api.access = await store_get("access")
+    api.refresh = await store_get("refresh")
+    if api.access or api.refresh:
+        show_home()
+        await load_tenders()      # falls back to login screen if the session is invalid
+    else:
+        show_login()
 
 
 ft.run(main)
