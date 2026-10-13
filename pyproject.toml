@@ -1,17 +1,23 @@
 [project]
-name = "hello-flet"
+name = "tenders-app"
 version = "1.0.0"
-description = "Hello World app built with Flet 1.0"
+description = "Tenders & bid submissions client (Flet)"
+readme = "README.md"
 requires-python = ">=3.10"
+authors = [{ name = "Zakaria Bouzegzeg" }]
 dependencies = [
-  "flet>=1.0.0",
+    "flet>=1.0.0",
+    "httpx>=0.27",
 ]
 
 [tool.flet]
-org = "com.example"
-product = "Hello Flet"
-company = "Example"
-copyright = "Copyright (C) 2026 Example"
+org = "tech.zeedcom"
+product = "Tenders"
+company = "Zeedcom"
+copyright = "Copyright (C) 2026 by Zeedcom"
 
 [tool.flet.app]
 path = "src"
+
+
+
